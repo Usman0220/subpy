@@ -1,73 +1,67 @@
-#!/usr/bin/env python3
 import subprocess
+import requests
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib3
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-MAX_THREADS = 50  # Change based on your CPU
-status_dict = defaultdict(list)
+# Suppress SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-def get_subdomains(domain):
+def run_subfinder(domain):
+    """Run subfinder and return a list of subdomains."""
     try:
-        print(f"[+] Running subfinder for: {domain}")
         result = subprocess.run(
-            ['subfinder', '-d', domain, '-silent'],
-            capture_output=True, text=True
+            ["subfinder", "-silent", "-d", domain],
+            capture_output=True,
+            text=True,
+            check=True
         )
-        subdomains = result.stdout.strip().split('\n')
-        return list(filter(None, subdomains))
-    except FileNotFoundError:
-        print("[!] subfinder not found. Install it and ensure it's in your PATH.")
-        sys.exit(1)
+        return result.stdout.splitlines()
+    except subprocess.CalledProcessError as e:
+        print("[!] Error running subfinder:", e)
+        return []
 
-def get_status(url):
+def check_status(url):
+    """Check HTTP status code of a given URL."""
     try:
-        curl = subprocess.run(
-            ['curl.exe', '-s', '-o', 'NUL', '-w', '%{http_code}',
-             '--connect-timeout', '3', '--max-time', '5', '--head', url],
-            capture_output=True, text=True
-        )
-        code = curl.stdout.strip()
-        return url, code
-    except Exception:
-        return url, 'ERR'
+        r = requests.get(url, timeout=10, verify=False, allow_redirects=False)
+        return url, r.status_code
+    except requests.exceptions.RequestException:
+        return url, 0  # [000] for failed
 
-def check_all(subdomains):
-    print("\n[+] Checking HTTP & HTTPS for each subdomain...\n")
-    tasks = []
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        for sub in subdomains:
-            for proto in ['http', 'https']:
-                url = f"{proto}://{sub}"
-                tasks.append(executor.submit(get_status, url))
+def main(domain):
+    print(f"[+] Running subfinder for: {domain}\n")
+    subdomains = run_subfinder(domain)
 
-        for future in as_completed(tasks):
+    print("[+] Checking HTTP & HTTPS for each subdomain...\n")
+
+    results = defaultdict(list)
+
+    urls = [f"{scheme}://{sub}" for sub in subdomains for scheme in ["http", "https"]]
+
+    # Run checks in parallel (50 threads like xargs -P 50)
+    with ThreadPoolExecutor(max_workers=50) as executor:
+        future_to_url = {executor.submit(check_status, url): url for url in urls}
+        for future in as_completed(future_to_url):
             url, code = future.result()
-            status_dict[code].append(url)
+            results[code].append(url)
 
-def print_ordered():
-    # Sort all codes numerically except put '200' last
-    codes_sorted = sorted(
-        [c for c in status_dict if c != '200'],
-        key=lambda x: (x.isdigit(), x)
-    ) + (['200'] if '200' in status_dict else [])
+    # Print all codes except 200 first, then 200 at the end
+    for code in sorted(results.keys()):
+        if code != 200:
+            print(f"\n🔹 Status [{code:03}]")
+            for u in results[code]:
+                print(u)
 
-    for code in codes_sorted:
-        print(f"\n🔹 Status [{code}]")
-        for url in sorted(status_dict[code]):
-            print(f"{url} [{code}]")
+    # Print 200 last if exists
+    if 200 in results:
+        print(f"\n🔹 Status [200]")
+        for u in results[200]:
+            print(u)
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: python3 subpy.py <domain.com>")
-        sys.exit(1)
-    
-    domain = sys.argv[1]
-    subdomains = get_subdomains(domain)
-
-    if not subdomains:
-        print("[!] No subdomains found.")
-        sys.exit(0)
-    
-    check_all(subdomains)
-    print_ordered()
+        print(f"Usage: python {sys.argv[0]} <domain>")
+    else:
+        main(sys.argv[1])
